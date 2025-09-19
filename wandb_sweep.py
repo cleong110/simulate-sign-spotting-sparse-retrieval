@@ -18,20 +18,16 @@ sweep_config = {
     },
 }
 
-
 # ----------------------------
 # Sweep function
 # ----------------------------
 def sweep_train():
-    # Initialize a run
     wandb.init(entity="colin-academic", project="sign-spotting-retrieval")
     cfg = wandb.config
 
-    # Path to corpus JSONL
     input_jsonl = Path("./phoenix2014_multisigner_video_transcripts.jsonl")
     out_jsonl = Path(f"./corrupted_corpus_{wandb.run.id}.jsonl")
 
-    # Run simulation
     metrics = run_simulation(
         input_jsonl=input_jsonl,
         synthetic=False,
@@ -39,23 +35,26 @@ def sweep_train():
         avg_doc_len=0,
         vocab_size=0,
         out_jsonl=out_jsonl,
-        spotter_vocab_fraction=cfg.spotter_vocab_fraction,
-        p_fn=cfg.p_fn,
-        p_fp=cfg.p_fp,
-        p_sub=cfg.p_sub,
+        spotter_vocab_fraction=float(cfg.spotter_vocab_fraction),
+        p_fn=float(cfg.p_fn),
+        p_fp=float(cfg.p_fp),
+        p_sub=float(cfg.p_sub),
         use_length_estimator=True,
-        length_bias=cfg.length_bias,
-        length_sigma=cfg.length_sigma,
+        length_bias=int(cfg.length_bias),
+        length_sigma=float(cfg.length_sigma),
         sample_count=300,
         seed=42,
     )
 
-    # Log metrics to WandB
     wandb.log(metrics)
 
 # ----------------------------
 # Main
 # ----------------------------
 if __name__ == "__main__":
-    sweep_id = wandb.sweep(sweep_config, project="sign_spotting_sim")
+    sweep_id = wandb.sweep(
+        sweep_config,
+        entity="colin-academic",
+        project="sign-spotting-retrieval",
+    )
     wandb.agent(sweep_id, function=sweep_train)

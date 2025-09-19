@@ -540,8 +540,8 @@ def run_simulation(
     top_terms = sorted(df_true.items(), key=lambda kv: -kv[1])[:5]
     true_docs_map = {doc_id: true_tokens for doc_id, true_tokens, _, _, _ in corrupted_docs}
 
-    sample_queries = [[t] for t, _ in top_terms]
-    sample_queries += [list(rnd.choice(list(true_docs_map.values()))) for _ in range(sample_count)]
+    # sample_queries = [[t] for t, _ in top_terms]
+    sample_queries = [list(rnd.choice(list(true_docs_map.values()))) for _ in range(sample_count)]
 
     k_eval = 10
 
