@@ -37,8 +37,25 @@ from typing import (
     Sequence,
     Tuple,
 )
-
+import wandb
 from tqdm import tqdm
+
+sweep_config = {
+    "method": "grid",  # or "random", "bayes"
+    "metric": {"name": "ndcg_drop", "goal": "minimize"},
+    "parameters": {
+        "p_fn": {"values": [0.0, 0.05, 0.1, 0.2]},
+        "p_fp": {"values": [0.0, 0.1, 0.2, 0.3]},
+        "p_sub": {"values": [0.0, 0.1, 0.2]},
+        "spotter_vocab_fraction": {"values": [0.5, 0.7, 0.9]},
+        "length_sigma": {"values": [5.0, 10.0, 20.0]},
+        "length_bias": {"values": [-10, 0, 10]},
+        "sample_count": {"value": 300},
+    },
+}
+
+
+
 
 # -------------------------
 # Logging / defaults
@@ -437,14 +454,17 @@ def run_simulation(
     use_length_estimator: bool,
     length_bias: int,
     length_sigma: float,
+    sample_count: int,
     seed: int,
-) -> None:
+) -> dict:
     """
-    Main simulation runner.
+    Main simulation runner with BM25 degradation.
     """
     rnd = random.Random(seed)
 
+    # -------------------------------
     # Create or load corpus
+    # -------------------------------
     if input_jsonl:
         LOGGER.info("Loading corpus from %s", input_jsonl)
         docs_list = load_corpus_jsonl(input_jsonl)
@@ -466,7 +486,9 @@ def run_simulation(
     else:
         raise ValueError("Either input_jsonl must be provided or --synthetic flag used")
 
-    # Spotter vocabulary
+    # -------------------------------
+    # Spotter vocab and configs
+    # -------------------------------
     corpus_vocab_set = sorted({t for _, toks in docs_list for t in toks})
     spotter_vocab_count = max(1, int(len(corpus_vocab_set) * spotter_vocab_fraction))
     spotter_vocab = rnd.sample(corpus_vocab_set, k=spotter_vocab_count)
@@ -483,143 +505,128 @@ def run_simulation(
     len_cfg = LengthEstimatorConfig(bias=length_bias, sigma=length_sigma, seed=seed)
     LOGGER.info(f"Length Estimation config: {len_cfg}")
 
-    LOGGER.info(
-        "Spotter vocab size=%d (%.2f%% of corpus vocab=%d)",
-        len(spotter_vocab),
-        100.0 * spotter_vocab_fraction,
-        len(corpus_vocab_set),
-    )
-
-    # Prepare output corrupted docs
-    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int, int]] = []
+    # -------------------------------
+    # Simulate spotting
+    # -------------------------------
+    corrupted_docs: list[tuple[str, Sequence[str], Sequence[str], int, int]] = []
     for doc_id, true_tokens in tqdm(docs_list, desc="Simulating spotter", unit="doc"):
-        spotted = simulate_spotter_on_doc(
-            true_tokens=true_tokens, config=spot_cfg, rnd=rnd
-        )
+        spotted = simulate_spotter_on_doc(true_tokens=true_tokens, config=spot_cfg, rnd=rnd)
         est_len = estimate_length(true_tokens=true_tokens, config=len_cfg, rnd=rnd)
         length_used = est_len if use_length_estimator else len(spotted)
-        corrupted_docs.append(
-            (doc_id, list(true_tokens), spotted, est_len, length_used)
-        )
+        corrupted_docs.append((doc_id, list(true_tokens), spotted, est_len, length_used))
 
-    # Write out corrupted corpus
     write_corrupted_corpus(
         corrupted_docs=corrupted_docs,
         out_jsonl=out_jsonl,
         use_length_estimator=use_length_estimator,
     )
-    LOGGER.info(
-        "Wrote corrupted corpus to %s (%d docs)", out_jsonl, len(corrupted_docs)
-    )
 
-    # Build BM25 indices using JSONL-style dicts
+    # -------------------------------
+    # Build BM25 indices
+    # -------------------------------
     idx_true = build_bm25_index(
-        [
-            {
-                "doc_id": doc_id,
-                "spotted_tokens": true_tokens,
-                "length_used": len(true_tokens),
-            }
-            for doc_id, true_tokens, _, _, _ in corrupted_docs
-        ]
+        [{"doc_id": doc_id, "spotted_tokens": true_tokens, "length_used": len(true_tokens)}
+         for doc_id, true_tokens, _, _, _ in corrupted_docs]
     )
     idx_spotted = build_bm25_index(
-        [
-            {"doc_id": doc_id, "spotted_tokens": spotted, "length_used": length_used}
-            for doc_id, _, spotted, _, length_used in corrupted_docs
-        ]
+        [{"doc_id": doc_id, "spotted_tokens": spotted, "length_used": length_used}
+         for doc_id, _, spotted, _, length_used in corrupted_docs]
     )
 
-    # Compute probes: DF and avgdl
-    df_true, avgdl_true = compute_df_and_avgdl(
-        [true_tokens for _, true_tokens, _, _, _ in corrupted_docs]
-    )
-    df_spotted, avgdl_spotted_tokens = compute_df_and_avgdl(
-        [spotted for _, _, spotted, _, _ in corrupted_docs]
-    )
-    estimated_lengths = [length_used for _, _, _, _, length_used in corrupted_docs]
-    avgdl_estimated = mean(estimated_lengths)
-
-    LOGGER.info(
-        "Corpus probes (true): vocab=%d avgdl=%.2f docs=%d",
-        len(df_true),
-        avgdl_true,
-        len(corrupted_docs),
-    )
-    LOGGER.info(
-        "Corpus probes (spotted tokens): vocab=%d avgdl=%.2f docs=%d",
-        len(df_spotted),
-        avgdl_spotted_tokens,
-        len(corrupted_docs),
-    )
-    LOGGER.info(
-        "Corpus probes (estimated lengths): avgdl=%.2f docs=%d",
-        avgdl_estimated,
-        len(corrupted_docs),
-    )
-
-    # Sample BM25 queries
+    # -------------------------------
+    # Sample queries
+    # -------------------------------
+    df_true, _ = compute_df_and_avgdl([true_tokens for _, true_tokens, _, _, _ in corrupted_docs])
     top_terms = sorted(df_true.items(), key=lambda kv: -kv[1])[:5]
-
-    # Map doc_id -> true_tokens
     true_docs_map = {doc_id: true_tokens for doc_id, true_tokens, _, _, _ in corrupted_docs}
 
-    # Add top terms + 10 random documents' true_tokens as queries
-    sample_queries = [[t] for (t, _) in top_terms] + [
-        list(rnd.choice(list(true_docs_map.values()))) for _ in range(10)
-    ]
-    # LOGGER.info("Sample queries (top true terms): %s", [q[0] for q in sample_queries])
-    k_eval = 10  # top-k for Precision, Recall, NDCG
-    q_preview_len = 5  # how many query tokens to display
+    sample_queries = [[t] for t, _ in top_terms]
+    sample_queries += [list(rnd.choice(list(true_docs_map.values()))) for _ in range(sample_count)]
 
-    for q in sample_queries:
+    k_eval = 10
+
+    # -------------------------------
+    # Run search and compute metrics
+    # -------------------------------
+    precisions, recalls, ndcgs_true, ndcgs_spotted, ndcg_drops, avg_degradations = [], [], [], [], [], []
+    per_query_info = []
+
+    for q in tqdm(sample_queries, desc="Running search"):
         scores_true = bm25_score(q, idx_true)
         scores_spotted = bm25_score(q, idx_spotted)
 
-        # Get top-k doc IDs
         top_true = sorted(scores_true.items(), key=lambda kv: -kv[1])[:k_eval]
         top_spotted = sorted(scores_spotted.items(), key=lambda kv: -kv[1])[:k_eval]
 
         top_true_ids = [doc_id for doc_id, _ in top_true]
         top_spot_ids = [doc_id for doc_id, _ in top_spotted]
 
-        # Precision & Recall @k
+        # Precision & Recall
         precision, recall = sign_spotting_precision_recall_at_k(
             true_tokens=top_true_ids,
             retrieved_tokens=top_spot_ids,
             k=k_eval,
         )
 
-        # NDCG @k
-        ndcg_true = ndcg_at_k(top_true_ids, scores_true, k=k_eval)
-        ndcg_spot = ndcg_at_k(top_spot_ids, scores_true, k=k_eval)
-        ndcg_drop = ndcg_true - ndcg_spot
+        # NDCG
+        ndcg_true_val = ndcg_at_k(top_true_ids, scores_true, k=k_eval)
+        ndcg_spot_val = ndcg_at_k(top_spot_ids, scores_true, k=k_eval)
+        ndcg_drop_val = ndcg_true_val - ndcg_spot_val
 
-        # Summarize in/out vocab
-        in_count = sum(1 for t in q if t in spotter_vocab)
-        out_count = len(q) - in_count
+        # BM25 score degradation
+        degradation = bm25_score_degradation(scores_true, scores_spotted)
+        avg_deg = mean(degradation.values()) if degradation else 0.0
 
-        # Preview of first few tokens
-        q_preview = q[:q_preview_len]
-        if len(q) > q_preview_len:
-            q_preview = q_preview + ["..."]
+        # Store
+        precisions.append(precision)
+        recalls.append(recall)
+        ndcgs_true.append(ndcg_true_val)
+        ndcgs_spotted.append(ndcg_spot_val)
+        ndcg_drops.append(ndcg_drop_val)
+        avg_degradations.append(avg_deg)
 
-        LOGGER.info(
-            "Query=%s (len=%d, in/out=%d/%d) -> Precision@%d=%.3f Recall@%d=%.3f "
-            "NDCG@%d true=%.3f spotted=%.3f drop=%.3f",
-            q_preview,
-            len(q),
-            in_count,
-            out_count,
-            k_eval,
-            precision,
-            k_eval,
-            recall,
-            k_eval,
-            ndcg_true,
-            ndcg_spot,
-            ndcg_drop,
-        )
+        per_query_info.append({
+            "query": q,
+            "precision": precision,
+            "recall": recall,
+            "ndcg_true": ndcg_true_val,
+            "ndcg_spotted": ndcg_spot_val,
+            "ndcg_drop": ndcg_drop_val,
+            "avg_score_degradation": avg_deg,
+        })
+
+    # -------------------------------
+    # Aggregate results
+    # -------------------------------
+    metrics = {
+        "precision": mean(precisions),
+        "recall": mean(recalls),
+        "ndcg_true": mean(ndcgs_true),
+        "ndcg_spotted": mean(ndcgs_spotted),
+        "ndcg_drop": mean(ndcg_drops),
+        "avg_score_degradation": mean(avg_degradations),
+        "per_query_info": per_query_info,
+    }
+
+    LOGGER.info(
+        "Aggregated over %d queries -> Precision@%d=%.3f Recall@%d=%.3f "
+        "NDCG@%d true=%.3f spotted=%.3f drop=%.3f avg_degradation=%.3f",
+        len(sample_queries),
+        k_eval,
+        metrics["precision"],
+        k_eval,
+        metrics["recall"],
+        k_eval,
+        metrics["ndcg_true"],
+        metrics["ndcg_spotted"],
+        metrics["ndcg_drop"],
+        metrics["avg_score_degradation"],
+    )
+
+    return metrics
+
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -696,8 +703,43 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Stddev for noise in length estimator (Gaussian).",
     )
+    p.add_argument(
+        "--sample-count",
+        type=int,
+        default=100,
+
+    )
     p.add_argument("--seed", type=int, default=42, help="RNG seed for reproducibility.")
     return p.parse_args()
+
+def run_experiment():
+    wandb.init(
+        entity="colin-academic-org",
+        project="sign-spotting-retrieval",
+    )
+    config = wandb.config
+
+    metrics = run_simulation(
+        input_jsonl="phoenix2014_multisigner_video_transcripts.jsonl",
+        p_fn=config.p_fn,
+        p_fp=config.p_fp,
+        p_sub=config.p_sub,
+        spotter_vocab_fraction=config.spotter_vocab_fraction,
+        length_sigma=config.length_sigma,
+        length_bias=config.length_bias,
+        use_length_estimator=True,
+        sample_count=config.sample_count,
+        synthetic=False,
+        n_docs=0,
+        avg_doc_len=0,
+        vocab_size=0,
+        out_jsonl=Path("corrupted.jsonl"),
+        seed=42,
+        return_metrics=True,
+    )
+
+    wandb.log(metrics)
+
 
 
 def main() -> None:
@@ -716,9 +758,12 @@ def main() -> None:
         use_length_estimator=args.use_length_estimator,
         length_bias=args.length_bias,
         length_sigma=max(0.0, args.length_sigma),
+        sample_count=max(1, args.sample_count),
         seed=args.seed,
     )
 
 
 if __name__ == "__main__":
     main()
+
+
