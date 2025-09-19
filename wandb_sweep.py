@@ -6,8 +6,8 @@ from simulate_sign_spotter import run_simulation
 # Sweep configuration
 # ----------------------------
 sweep_config = {
-    "method": "grid",  # or "random" / "bayes"
-    "metric": {"name": "ndcg_drop", "goal": "minimize"},  # smaller drop is better
+    "method": "grid",
+    "metric": {"name": "ndcg_drop", "goal": "minimize"},
     "parameters": {
         "p_fn": {"values": [0.0, 0.05, 0.1]},
         "p_fp": {"values": [0.0, 0.1, 0.2]},
@@ -18,12 +18,13 @@ sweep_config = {
     },
 }
 
+
 # ----------------------------
 # Sweep function
 # ----------------------------
 def sweep_train():
     # Initialize a run
-    wandb.init(entity="colin-academic-org", project="sign-spotting-retrieval")
+    wandb.init(entity="colin-academic", project="sign-spotting-retrieval")
     cfg = wandb.config
 
     # Path to corpus JSONL
