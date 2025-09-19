@@ -205,7 +205,7 @@ def write_corrupted_corpus(
     Write JSONL with doc_id, true tokens, spotted tokens, and both length measures.
     """
     with out_jsonl.open("w", encoding="utf-8") as f:
-        for doc_id, true_tokens, spotted_tokens, est_len in corrupted_docs:
+        for doc_id, true_tokens, spotted_tokens, est_len, length_used in corrupted_docs:
             spotted_len = len(spotted_tokens)
             rec = {
                 "doc_id": doc_id,
@@ -214,7 +214,7 @@ def write_corrupted_corpus(
                 "length_true": len(true_tokens),
                 "length_spotted": spotted_len,
                 "length_estimated": est_len,
-                "length_used": est_len if use_length_estimator else spotted_len,
+                "length_used": length_used,
                 "length_source": "estimator" if use_length_estimator else "spotted",
             }
             f.write(json.dumps(rec) + "\n")
@@ -249,68 +249,56 @@ def load_corpus_jsonl(path: Path) -> List[Tuple[str, List[str]]]:
 # -------------------------
 # Tiny BM25 utilities
 # -------------------------
-
-
-def build_bm25_index(
-    docs: Mapping[str, Sequence[str]],
-    *,
-    use_length_estimator: bool = False,
-    length_config: Optional[LengthEstimatorConfig] = None,
-) -> Dict[str, object]:
+def build_bm25_index(docs: Iterable[Dict[str, object]]) -> Dict[str, object]:
     """
-    Build a minimal BM25 index structure: DF, IDF, per-doc TF, doc lengths, avgdl.
+    Build a simple BM25 index from a sequence of precomputed JSONL-style records.
 
-    Args:
-        docs: Mapping from doc_id -> list of tokens.
-        use_length_estimator: If True, estimate document lengths using the provided config.
-        length_config: Config for noisy length estimator (required if use_length_estimator=True).
+    Each record in `docs` should be a dict with the following fields:
+      - 'doc_id': str
+          Unique document identifier.
+      - 'spotted_tokens': Sequence[str]
+          Tokenized document content (can be true tokens or spotted tokens).
+      - 'length_used': int
+          Precomputed document length to use for BM25 (either estimated length or
+          actual token count).
+
+    The index contains:
+      - N: total number of documents
+      - df: document frequency per token
+      - idf: inverse document frequency per token
+      - tf: term frequency per document (dict of token -> count)
+      - doc_len: length used per document (from 'length_used')
+      - avgdl: average document length across all documents
+
+    Returns:
+        Dict[str, object]: BM25 index dictionary suitable for `bm25_score`.
     """
     N = len(docs)
     df: Dict[str, int] = {}
     tf: Dict[str, Dict[str, int]] = {}
     doc_len: Dict[str, int] = {}
 
-    rnd = (
-        random.Random(length_config.seed)
-        if length_config and length_config.seed
-        else None
-    )
+    for rec in docs:
+        doc_id = rec["doc_id"]
+        tokens: List[str] = rec["spotted_tokens"]
+        length_used: int = rec["length_used"]
 
-    for doc_id, tokens in docs.items():
-        # term frequencies
-        tf[doc_id] = {}
+        seen: Dict[str, int] = {}
         for t in tokens:
-            tf[doc_id][t] = tf[doc_id].get(t, 0) + 1
+            seen[t] = seen.get(t, 0) + 1
+        tf[doc_id] = seen
+        doc_len[doc_id] = length_used
 
-        # update df
-        for t in tf[doc_id]:
+        for t in seen:
             df[t] = df.get(t, 0) + 1
 
-        # choose doc length source
-        if use_length_estimator:
-            if length_config is None:
-                raise ValueError(
-                    "length_config must be provided when use_length_estimator=True"
-                )
-            doc_len[doc_id] = estimate_length(tokens, config=length_config, rnd=rnd)
-        else:
-            doc_len[doc_id] = len(tokens)
-
-    avgdl = mean(list(doc_len.values())) if doc_len else 0.0
-
-    idf: Dict[str, float] = {}
-    for t, dfv in df.items():
-        # BM25 IDF with +0.5 smoothing
-        idf[t] = math.log(1 + (N - dfv + 0.5) / (dfv + 0.5))
-
-    return {
-        "N": N,
-        "df": df,
-        "idf": idf,
-        "tf": tf,
-        "doc_len": doc_len,
-        "avgdl": avgdl,
+    avgdl = mean(doc_len.values()) if doc_len else 0.0
+    idf: Dict[str, float] = {
+        t: math.log(1 + (N - dfv + 0.5) / (dfv + 0.5)) for t, dfv in df.items()
     }
+
+    return {"N": N, "df": df, "idf": idf, "tf": tf, "doc_len": doc_len, "avgdl": avgdl}
+
 
 
 def bm25_score(
@@ -341,6 +329,101 @@ def bm25_score(
     return scores
 
 
+# ------------------------
+# SIgn Spotting Metrics
+# ------------------------
+def sign_spotting_precision_recall_at_k(
+    true_tokens: Sequence[str],
+    retrieved_tokens: Sequence[str],
+    k: int
+) -> Tuple[float, float]:
+    """
+    Compute Precision@k and Recall@k for a single document.
+
+    Args:
+        true_tokens: the ground-truth tokens for this document
+        retrieved_tokens: the tokens retrieved / spotted by the model
+        k: cutoff for top-k tokens
+
+    Returns:
+        precision, recall: both in [0, 1]
+    """
+    if not true_tokens:
+        return 0.0, 0.0
+
+    top_k = retrieved_tokens[:k]
+    correct = sum(1 for t in top_k if t in true_tokens)
+
+    precision = correct / min(k, len(top_k))
+    recall = correct / len(true_tokens)
+
+    return precision, recall
+
+
+# --------------------------
+# Retrieval Performance
+# --------------------------
+def bm25_score_degradation(
+    scores_true: Dict[str, float],
+    scores_spotted: Dict[str, float]
+) -> Dict[str, float]:
+    """
+    Compute relative drop in BM25 score per document.
+    """
+    degradation: Dict[str, float] = {}
+    for doc_id, s_true in scores_true.items():
+        s_spot = scores_spotted.get(doc_id, 0.0)
+        degradation[doc_id] = 1.0 - (s_spot / s_true) if s_true > 0 else 0.0
+    return degradation
+
+def rank_correlation_at_k(
+    true_ranking: List[str],  # doc_ids sorted by true BM25
+    spotted_ranking: List[str],  # doc_ids sorted by spotted BM25
+    k: int
+) -> float:
+    """
+    Returns fraction of overlap in top-k docs.
+    """
+    top_true = set(true_ranking[:k])
+    top_spot = set(spotted_ranking[:k])
+    return len(top_true & top_spot) / k
+
+
+def dcg_at_k(relevances: Sequence[float], k: int) -> float:
+    """
+    Compute Discounted Cumulative Gain at k.
+    """
+    dcg = 0.0
+    for i, rel in enumerate(relevances[:k]):
+        dcg += rel / math.log2(i + 2)  # i+2 because log2(1) = 0
+    return dcg
+
+def ndcg_at_k(
+    top_docs: Sequence[str],
+    scores_true: Dict[str, float],
+    k: int
+) -> float:
+    """
+    Compute NDCG@k for retrieved documents against true BM25 scores.
+
+    Args:
+        top_docs: ordered list of doc_ids retrieved by the system
+        scores_true: mapping doc_id -> relevance score from true corpus
+        k: cutoff
+
+    Returns:
+        NDCG@k in [0,1]
+    """
+    # Relevance in retrieved order
+    rels = [scores_true.get(doc_id, 0.0) for doc_id in top_docs]
+    dcg = dcg_at_k(rels, k)
+
+    # Ideal DCG (sort by true relevance)
+    ideal_rels = sorted(scores_true.values(), reverse=True)
+    idcg = dcg_at_k(ideal_rels, k)
+
+    return dcg / idcg if idcg > 0 else 0.0
+
 # -------------------------
 # Runner / CLI
 # -------------------------
@@ -356,7 +439,7 @@ def run_simulation(
     p_fn: float,
     p_fp: float,
     p_sub: float,
-    use_length_estimator: bool,  # fixed spelling
+    use_length_estimator: bool,
     length_bias: int,
     length_sigma: float,
     seed: int,
@@ -380,7 +463,6 @@ def run_simulation(
         corpus_vocab = [f"g{idx}" for idx in range(vocab_size)]
         docs_list = []
         for di in range(n_docs):
-            # length drawn around avg_doc_len +/- up to 50%
             doc_len = max(
                 1, rnd.randint(max(1, avg_doc_len // 2), max(1, avg_doc_len * 3 // 2))
             )
@@ -389,10 +471,9 @@ def run_simulation(
     else:
         raise ValueError("Either input_jsonl must be provided or --synthetic flag used")
 
-    # Spotter vocabulary: fraction of corpus vocab or independent
+    # Spotter vocabulary
     corpus_vocab_set = sorted({t for _, toks in docs_list for t in toks})
     spotter_vocab_count = max(1, int(len(corpus_vocab_set) * spotter_vocab_fraction))
-    # Choose spotter vocab as subset of corpus vocab by default
     spotter_vocab = rnd.sample(corpus_vocab_set, k=spotter_vocab_count)
 
     spot_cfg = SpotterConfig(
@@ -414,76 +495,82 @@ def run_simulation(
         len(corpus_vocab_set),
     )
 
-    # Prepare output docs generator
-    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int]] = []
+    # Prepare output corrupted docs
+    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int, int]] = []
     for doc_id, true_tokens in tqdm(docs_list, desc="Simulating spotter", unit="doc"):
-        spotted = simulate_spotter_on_doc(
-            true_tokens=true_tokens, config=spot_cfg, rnd=rnd
-        )
+        spotted = simulate_spotter_on_doc(true_tokens=true_tokens, config=spot_cfg, rnd=rnd)
         est_len = estimate_length(true_tokens=true_tokens, config=len_cfg, rnd=rnd)
-        corrupted_docs.append((doc_id, list(true_tokens), spotted, est_len))
+        length_used = est_len if use_length_estimator else len(spotted)
+        corrupted_docs.append((doc_id, list(true_tokens), spotted, est_len, length_used))
 
     # Write out corrupted corpus
-    write_corrupted_corpus(
-        corrupted_docs=corrupted_docs,
-        out_jsonl=out_jsonl,
-        use_length_estimator=use_length_estimator,
-    )
+    write_corrupted_corpus(corrupted_docs=corrupted_docs, out_jsonl=out_jsonl, use_length_estimator=use_length_estimator)
+    LOGGER.info("Wrote corrupted corpus to %s (%d docs)", out_jsonl, len(corrupted_docs))
 
-    LOGGER.info(
-        "Wrote corrupted corpus to %s (%d docs)", out_jsonl, len(corrupted_docs)
-    )
+    # Build BM25 indices using JSONL-style dicts
+    idx_true = build_bm25_index([
+        {"doc_id": doc_id, "spotted_tokens": true_tokens, "length_used": len(true_tokens)}
+        for doc_id, true_tokens, _, _, _ in corrupted_docs
+    ])
+    idx_spotted = build_bm25_index([
+        {"doc_id": doc_id, "spotted_tokens": spotted, "length_used": length_used}
+        for doc_id, _, spotted, _, length_used in corrupted_docs
+    ])
 
-    # Compute probes: DF and avgdl before/after
-    true_docs_map = {doc_id: toks for (doc_id, toks, _, _) in corrupted_docs}
-    spotted_docs_map = {doc_id: spotted for (doc_id, _, spotted, _) in corrupted_docs}
-
-    df_true, avgdl_true = compute_df_and_avgdl(true_docs_map.values())
-    df_spotted, avgdl_spotted_tokens = compute_df_and_avgdl(spotted_docs_map.values())
-
-    estimated_lengths = [est for (_, _, _, est) in corrupted_docs]
+    # Compute probes: DF and avgdl
+    df_true, avgdl_true = compute_df_and_avgdl([true_tokens for _, true_tokens, _, _, _ in corrupted_docs])
+    df_spotted, avgdl_spotted_tokens = compute_df_and_avgdl([spotted for _, _, spotted, _, _ in corrupted_docs])
+    estimated_lengths = [length_used for _, _, _, _, length_used in corrupted_docs]
     avgdl_estimated = mean(estimated_lengths)
 
     LOGGER.info(
         "Corpus probes (true): vocab=%d avgdl=%.2f docs=%d",
-        len(df_true),
-        avgdl_true,
-        len(true_docs_map),
+        len(df_true), avgdl_true, len(corrupted_docs)
     )
     LOGGER.info(
         "Corpus probes (spotted tokens): vocab=%d avgdl=%.2f docs=%d",
-        len(df_spotted),
-        avgdl_spotted_tokens,
-        len(spotted_docs_map),
+        len(df_spotted), avgdl_spotted_tokens, len(corrupted_docs)
     )
     LOGGER.info(
         "Corpus probes (estimated lengths): avgdl=%.2f docs=%d",
-        avgdl_estimated,
-        len(spotted_docs_map),
+        avgdl_estimated, len(corrupted_docs)
     )
 
-    # Build BM25 indices
-    idx_true = build_bm25_index(true_docs_map)  # always true lengths
-    idx_spotted = build_bm25_index(
-        spotted_docs_map,
-        use_length_estimator=use_length_estimator,
-        length_config=len_cfg,
-    )
-
-    # For demonstration compute BM25 ranking for a sample of queries (top tokens by DF in true corpus)
-    top_terms = sorted(df_true.items(), key=lambda kv: -kv[1])[:5]
+    # Sample BM25 queries
+    top_terms = sorted(df_true.items(), key=lambda kv: -kv[1])[:10]
     sample_queries = [[t] for (t, _) in top_terms]
     LOGGER.info("Sample queries (top true terms): %s", [q[0] for q in sample_queries])
 
+    k=10
     for q in sample_queries:
         scores_true = bm25_score(q, idx_true)
         scores_spotted = bm25_score(q, idx_spotted)
-        # show top-3 doc ids and scores
-        top_true = sorted(scores_true.items(), key=lambda kv: -kv[1])[:3]
-        top_spotted = sorted(scores_spotted.items(), key=lambda kv: -kv[1])[:3]
+
+        top_true = sorted(scores_true.items(), key=lambda kv: -kv[1])[:k]
+        top_spotted = sorted(scores_spotted.items(), key=lambda kv: -kv[1])[:k]
+
+        # LOGGER.info("Query=%s -> \n\ttop_true=%s \n\ttop_spotted=%s", q, top_true, top_spotted)
+
+        deg = bm25_score_degradation(scores_true, scores_spotted)
+        avg_deg = mean(deg.values())
+
+        true_ids = [doc_id for doc_id, _ in top_true]
+        spot_ids = [doc_id for doc_id, _ in top_spotted]
+        correlation = rank_correlation_at_k(true_ids, spot_ids, k=k)
+
         LOGGER.info(
-            "Query=%s -> \n\ttop_true=%s \n\ttop_spotted=%s", q, top_true, top_spotted
+            "Query=%s -> Avg BM25 score degradation: %.3f. Rank Correlation@%d: %.3f",
+            q,
+            avg_deg,
+            k,
+            correlation,
         )
+        
+
+
+
+
+
 
 
 def parse_args() -> argparse.Namespace:
