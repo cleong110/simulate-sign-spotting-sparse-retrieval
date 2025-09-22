@@ -1,59 +1,100 @@
-import argparse
+import itertools
 from pathlib import Path
 import wandb
 from simulate_sign_spotter import run_simulation
+import math
+import random
+from typing import Iterator, Sequence, Tuple
+
+# ----------------------------
+# Grid of parameter values
+# ----------------------------
+grid_params = {
+    "p_fn": [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99],
+    "p_fp": [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99],
+    "p_sub": [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99],
+    "spotter_vocab_fraction": [
+        0.01,
+        0.05,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        0.95,
+        1.0,
+    ],
+    "length_sigma": [0.0, 5.0, 10.0, 50.0],
+    "length_bias": [0, -5, -10, 10, 20, -20, 50, -50, 70, -70, 100, -100],
+    "use_length_estimator": [True, False],
+}
+
+# Fixed arguments
+fixed_args = {
+    # "input_jsonl": Path("./phoenix2014_multisigner_video_transcripts.jsonl"),
+    "input_jsonl": Path("./phoenix2014_multisigner_segment_transcripts.jsonl"),
+    "synthetic": False,
+    "n_docs": 0,
+    "avg_doc_len": 0,
+    "vocab_size": 0,
+    "out_jsonl": Path("corrupted_corpus.jsonl"),
+    # "use_length_estimator": True,
+    "sample_count": 1000,
+    "seed": 42,
+}
+
+
+def random_product(*values: Sequence) -> Iterator[Tuple]:
+    """
+    Yield all tuples from the Cartesian product of given sequences
+    in random order, without materializing the full product.
+
+    Compatible with itertools.product(*values).
+    """
+    sizes = [len(seq) for seq in values]
+    total = math.prod(sizes)
+
+    # shuffle the linear indices
+    indices = list(range(total))
+    random.shuffle(indices)
+
+    for idx in indices:
+        coords = []
+        for size, seq in reversed(list(zip(sizes, values))):
+            idx, pos = divmod(idx, size)
+            coords.append(seq[pos])
+        yield tuple(reversed(coords))
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Run a single sign-spotting simulation with WandB logging")
+    # Generate all combinations of the grid
+    keys, values = zip(*grid_params.items())
+    # for combination in itertools.product(*values):
+    for combination in random_product(*values):
+        params = dict(zip(keys, combination))
+        run_config = {**fixed_args, **params}
 
-    parser.add_argument("--input-jsonl", type=Path, default=None, help="Path to corpus JSONL")
-    parser.add_argument("--synthetic", action="store_true", help="Generate a synthetic corpus instead of using input JSONL")
-    parser.add_argument("--n-docs", type=int, default=100, help="Number of synthetic documents if synthetic=True")
-    parser.add_argument("--avg-doc-len", type=int, default=50, help="Average length of synthetic documents")
-    parser.add_argument("--vocab-size", type=int, default=500, help="Vocabulary size for synthetic documents")
-    parser.add_argument("--out-jsonl", type=Path, default=Path("corrupted_corpus.jsonl"), help="Path to write corrupted corpus")
-    parser.add_argument("--spotter-vocab-fraction", type=float, default=0.7)
-    parser.add_argument("--p-fn", type=float, default=0.05)
-    parser.add_argument("--p-fp", type=float, default=0.2)
-    parser.add_argument("--p-sub", type=float, default=0.2)
-    parser.add_argument("--use-length-estimator", action="store_true")
-    parser.add_argument("--length-bias", type=int, default=-10)
-    parser.add_argument("--length-sigma", type=float, default=10.0)
-    parser.add_argument("--sample-count", type=int, default=300)
-    parser.add_argument("--seed", type=int, default=42)
+        # Initialize WandB run
+        wandb.init(
+            entity="colin-academic",
+            project="sign-spotting-retrieval",
+            config=run_config,
+            reinit=True,
+        )
 
-    args = parser.parse_args()
+        print(f"Running simulation with params: {params}")
+        metrics = run_simulation(**run_config)
 
-    # Initialize WandB
-    wandb.init(
-        entity="colin-academic",
-        project="sign-spotting-retrieval",
-        config=vars(args),
-        name="single-run"
-    )
+        # Log metrics to WandB
+        wandb.log(metrics)
+        wandb.finish()
 
-    metrics = run_simulation(
-        input_jsonl=args.input_jsonl,
-        synthetic=args.synthetic,
-        n_docs=args.n_docs,
-        avg_doc_len=args.avg_doc_len,
-        vocab_size=args.vocab_size,
-        out_jsonl=args.out_jsonl,
-        spotter_vocab_fraction=args.spotter_vocab_fraction,
-        p_fn=args.p_fn,
-        p_fp=args.p_fp,
-        p_sub=args.p_sub,
-        use_length_estimator=args.use_length_estimator,
-        length_bias=args.length_bias,
-        length_sigma=args.length_sigma,
-        sample_count=args.sample_count,
-        seed=args.seed,
-    )
+        print("Metrics:", metrics)
 
-    # Log metrics to WandB
-    wandb.log(metrics)
-
-    print("Metrics:", metrics)
 
 if __name__ == "__main__":
     main()
