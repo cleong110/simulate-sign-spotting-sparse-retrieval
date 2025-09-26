@@ -1,9 +1,10 @@
-from pathlib import Path
-import wandb
-from simulate_sign_spotter import run_simulation
 import math
 import random
-from typing import Iterator, Sequence, Tuple
+from pathlib import Path
+from typing import Iterator, Sequence
+
+import wandb
+from simulate_sign_spotting_sparse_retrieval.simulate_sign_spotter import run_simulation
 
 # ----------------------------
 # Grid of parameter values
@@ -36,7 +37,7 @@ grid_params = {
 # Fixed arguments
 fixed_args = {
     # "input_jsonl": Path("./phoenix2014_multisigner_video_transcripts.jsonl"),
-    "input_jsonl": Path("./phoenix2014_multisigner_segment_transcripts.jsonl"),
+    "input_jsonl": Path(r"simulate_sign_spotting_sparse_retrieval\test_data\phoenix2014_multisigner_segment_transcripts.jsonl"),
     "synthetic": False,
     "n_docs": 0,
     "avg_doc_len": 0,
@@ -48,7 +49,7 @@ fixed_args = {
 }
 
 
-def random_product(*values: Sequence) -> Iterator[Tuple]:
+def random_product(*values: Sequence) -> Iterator[tuple]:
     """
     Yield all tuples from the Cartesian product of given sequences
     in random order, without materializing the full product.
