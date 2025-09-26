@@ -15,6 +15,8 @@ But for sign languages we don't know these things, and need to estimate them.
 
 How good must these estimators be, for it to work?
 
+Inspired in part by [Evaluating ASR Output for Information Retrieval](https://www.researchgate.net/publication/241880526f)
+
 
 ### Test Data Attribution
 Test data is extracted from PHOENIX 2014, the RWTH-Weather-Phoenix 2014 multisigner set. 
