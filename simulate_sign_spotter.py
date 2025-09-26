@@ -14,7 +14,7 @@ Outputs a corrupted JSONL corpus with fields:
 Also provides utilities to compute DF / avgdl and a simple BM25 scorer
 to compare scoring on true vs spotted token corpora.
 
-Author: ChatGPT (meticulous-python style)
+Author: ChatGPT (meticulous-python style) and Colin Leong, prompter and checker.
 """
 
 from __future__ import annotations
@@ -39,22 +39,6 @@ from typing import (
 )
 import wandb
 from tqdm import tqdm
-
-sweep_config = {
-    "method": "grid",  # or "random", "bayes"
-    "metric": {"name": "ndcg_drop", "goal": "minimize"},
-    "parameters": {
-        "p_fn": {"values": [0.0, 0.05, 0.1, 0.2]},
-        "p_fp": {"values": [0.0, 0.1, 0.2, 0.3]},
-        "p_sub": {"values": [0.0, 0.1, 0.2]},
-        "spotter_vocab_fraction": {"values": [0.5, 0.7, 0.9]},
-        "length_sigma": {"values": [5.0, 10.0, 20.0]},
-        "length_bias": {"values": [-10, 0, 10]},
-        "sample_count": {"value": 300},
-    },
-}
-
-
 
 
 # -------------------------
@@ -123,69 +107,61 @@ def compute_df_and_avgdl(docs: Iterable[Sequence[str]]) -> Tuple[Dict[str, int],
 # Spotter simulation
 # -------------------------
 def simulate_spotter_on_doc(
+    *,
     true_tokens: Sequence[str],
     config: SpotterConfig,
-    rnd: Optional[random.Random] = None,
-) -> List[str]:
+    rnd: random.Random,
+) -> tuple[list[str], dict[str, int]]:
     """
-    Simulate the spotter output for a single document (sequence of true gloss tokens).
+    Simulate spotting on a single document.
 
-    Behavior:
-      - If a true token is *not* in spotter_vocab -> it's unrecognizable -> treated as false-negative with probability 1.
-      - Otherwise, for each true token:
-           * with per-gloss FN probability (if provided) or global p_false_negative -> drop (false negative).
-           * else with p_substitution -> replace with another token from spotter_vocab (substitution).
-           * else keep the token (recognized correctly).
-      - After processing true tokens, insert spurious tokens with probability p_false_positive per true-token position.
+    Returns spotted tokens, and if return_stats=True, also returns a dict with
+    per-document statistics:
+      - true_tokens_count
+      - true_positives_kept
+      - true_positives_dropped
+      - false_positives_inserted
+      - substitutions_made
     """
-    rnd_local = rnd or random.Random(config.seed)
-    spotted: List[str] = []
-    spot_vocab = list(config.spotter_vocab)
-
-    # Precompute per-gloss rates
-    per_fn = config.per_gloss_fn or {}
-    per_fp = config.per_gloss_fp or {}
+    spotted: list[str] = []
+    stats = {
+        "true_tokens_count": len(true_tokens),
+        "true_positives_kept": 0,
+        "true_positives_dropped": 0,
+        "false_positives_inserted": 0,
+        "substitutions_made": 0,
+    }
 
     for tok in true_tokens:
-        # If token isn't in spotter's vocabulary, it cannot be recognized unless substituted into a known token.
-        if tok not in spot_vocab:
-            # treat as FN (drop) unless substitution occurs
-            p_fn_effective = 1.0  # default drop if not in vocab
+        if tok not in config.spotter_vocab:
+            # token not in spotter vocab: drop it
+            stats["true_positives_dropped"] += 1
+            continue
+
+        # false negative?
+        if rnd.random() < config.p_false_negative:
+            stats["true_positives_dropped"] += 1
+            continue
+
+        # substitution?
+        if rnd.random() < config.p_substitution:
+            # replace with some other vocab token
+            substitute = rnd.choice(config.spotter_vocab)
+            spotted.append(substitute)
+            stats["substitutions_made"] += 1
+            stats["true_positives_kept"] += 1  # still counts as a kept token
         else:
-            p_fn_effective = float(per_fn.get(tok, config.p_false_negative))
+            # keep as-is
+            spotted.append(tok)
+            stats["true_positives_kept"] += 1
 
-        # false negative
-        if rnd_local.random() < p_fn_effective:
-            # dropped - nothing appended for this true token
-            pass
-        else:
-            # recognized (either correct or substitution)
-            if rnd_local.random() < config.p_substitution:
-                # substitution: pick a different token from spotter vocab (avoid same if possible)
-                if len(spot_vocab) <= 1:
-                    chosen = spot_vocab[0]
-                else:
-                    # avoid choosing the same gloss if present
-                    candidates = [g for g in spot_vocab if g != tok]
-                    chosen = (
-                        rnd_local.choice(candidates) if candidates else spot_vocab[0]
-                    )
-                spotted.append(chosen)
-            else:
-                # correctly recognized token
-                if tok in spot_vocab:
-                    spotted.append(tok)
-                else:
-                    # fallback: choose a random spotter token (unlikely to happen because p_fn_effective would be 1)
-                    spotted.append(rnd_local.choice(spot_vocab))
+        # false positive insertion?
+        if rnd.random() < config.p_false_positive:
+            fp_tok = rnd.choice(config.spotter_vocab)
+            spotted.append(fp_tok)
+            stats["false_positives_inserted"] += 1
 
-        # possible insertion (false positive) after this position
-        p_fp_effective = float(per_fp.get(tok, config.p_false_positive))
-        if rnd_local.random() < p_fp_effective:
-            inserted = rnd_local.choice(spot_vocab)
-            spotted.append(inserted)
-
-    return spotted
+    return spotted, stats
 
 
 # -------------------------
@@ -214,7 +190,7 @@ def estimate_length(
 # Corpus I/O
 # -------------------------
 def write_corrupted_corpus(
-    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int]],
+    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int, int]],
     out_jsonl: Path,
     use_length_estimator: bool,
 ) -> None:
@@ -508,12 +484,22 @@ def run_simulation(
     # -------------------------------
     # Simulate spotting
     # -------------------------------
+    doc_stats: list[dict[str, int]] = []
     corrupted_docs: list[tuple[str, Sequence[str], Sequence[str], int, int]] = []
+
     for doc_id, true_tokens in tqdm(docs_list, desc="Simulating spotter", unit="doc"):
-        spotted = simulate_spotter_on_doc(true_tokens=true_tokens, config=spot_cfg, rnd=rnd)
+        spotted, stats = simulate_spotter_on_doc(
+            true_tokens=true_tokens,
+            config=spot_cfg,
+            rnd=rnd,
+        )
         est_len = estimate_length(true_tokens=true_tokens, config=len_cfg, rnd=rnd)
         length_used = est_len if use_length_estimator else len(spotted)
-        corrupted_docs.append((doc_id, list(true_tokens), spotted, est_len, length_used))
+
+        corrupted_docs.append(
+            (doc_id, list(true_tokens), spotted, est_len, length_used)
+        )
+        doc_stats.append(stats)
 
     write_corrupted_corpus(
         corrupted_docs=corrupted_docs,
@@ -525,30 +511,51 @@ def run_simulation(
     # Build BM25 indices
     # -------------------------------
     idx_true = build_bm25_index(
-        [{"doc_id": doc_id, "spotted_tokens": true_tokens, "length_used": len(true_tokens)}
-         for doc_id, true_tokens, _, _, _ in corrupted_docs]
+        [
+            {
+                "doc_id": doc_id,
+                "spotted_tokens": true_tokens,
+                "length_used": len(true_tokens),
+            }
+            for doc_id, true_tokens, _, _, _ in corrupted_docs
+        ]
     )
     idx_spotted = build_bm25_index(
-        [{"doc_id": doc_id, "spotted_tokens": spotted, "length_used": length_used}
-         for doc_id, _, spotted, _, length_used in corrupted_docs]
+        [
+            {"doc_id": doc_id, "spotted_tokens": spotted, "length_used": length_used}
+            for doc_id, _, spotted, _, length_used in corrupted_docs
+        ]
     )
 
     # -------------------------------
     # Sample queries
     # -------------------------------
-    df_true, _ = compute_df_and_avgdl([true_tokens for _, true_tokens, _, _, _ in corrupted_docs])
+    df_true, _ = compute_df_and_avgdl(
+        [true_tokens for _, true_tokens, _, _, _ in corrupted_docs]
+    )
     top_terms = sorted(df_true.items(), key=lambda kv: -kv[1])[:5]
-    true_docs_map = {doc_id: true_tokens for doc_id, true_tokens, _, _, _ in corrupted_docs}
+    true_docs_map = {
+        doc_id: true_tokens for doc_id, true_tokens, _, _, _ in corrupted_docs
+    }
 
     # sample_queries = [[t] for t, _ in top_terms]
-    sample_queries = [list(rnd.choice(list(true_docs_map.values()))) for _ in range(sample_count)]
+    sample_queries = [
+        list(rnd.choice(list(true_docs_map.values()))) for _ in range(sample_count)
+    ]
 
     k_eval = 10
 
     # -------------------------------
     # Run search and compute metrics
     # -------------------------------
-    precisions, recalls, ndcgs_true, ndcgs_spotted, ndcg_drops, avg_degradations = [], [], [], [], [], []
+    precisions, recalls, ndcgs_true, ndcgs_spotted, ndcg_drops, avg_degradations = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     per_query_info = []
 
     for q in tqdm(sample_queries, desc="Running search"):
@@ -585,15 +592,17 @@ def run_simulation(
         ndcg_drops.append(ndcg_drop_val)
         avg_degradations.append(avg_deg)
 
-        per_query_info.append({
-            "query": q,
-            "precision": precision,
-            "recall": recall,
-            "ndcg_true": ndcg_true_val,
-            "ndcg_spotted": ndcg_spot_val,
-            "ndcg_drop": ndcg_drop_val,
-            "avg_score_degradation": avg_deg,
-        })
+        per_query_info.append(
+            {
+                "query": q,
+                "precision": precision,
+                "recall": recall,
+                "ndcg_true": ndcg_true_val,
+                "ndcg_spotted": ndcg_spot_val,
+                "ndcg_drop": ndcg_drop_val,
+                "avg_score_degradation": avg_deg,
+            }
+        )
 
     # -------------------------------
     # Aggregate results
@@ -608,25 +617,33 @@ def run_simulation(
         "per_query_info": per_query_info,
     }
 
-    LOGGER.info(
-        "Aggregated over %d queries -> Precision@%d=%.3f Recall@%d=%.3f "
-        "NDCG@%d true=%.3f spotted=%.3f drop=%.3f avg_degradation=%.3f",
-        len(sample_queries),
-        k_eval,
-        metrics["precision"],
-        k_eval,
-        metrics["recall"],
-        k_eval,
-        metrics["ndcg_true"],
-        metrics["ndcg_spotted"],
-        metrics["ndcg_drop"],
-        metrics["avg_score_degradation"],
-    )
+    # -------------------------------
+    # Aggregate spotter statistics
+    # -------------------------------
+    agg_stats = {
+        "true_tokens_total": sum(s["true_tokens_count"] for s in doc_stats),
+        "true_positives_kept_total": sum(s["true_positives_kept"] for s in doc_stats),
+        "true_positives_dropped_total": sum(
+            s["true_positives_dropped"] for s in doc_stats
+        ),
+        "false_positives_inserted_total": sum(
+            s["false_positives_inserted"] for s in doc_stats
+        ),
+        "substitutions_made_total": sum(s["substitutions_made"] for s in doc_stats),
+    }
+
+    metrics = {
+        "precision": mean(precisions),
+        "recall": mean(recalls),
+        "ndcg_true": mean(ndcgs_true),
+        "ndcg_spotted": mean(ndcgs_spotted),
+        "ndcg_drop": mean(ndcg_drops),
+        "avg_score_degradation": mean(avg_degradations),
+        "per_query_info": per_query_info,
+        **agg_stats,  # include spotting stats
+    }
 
     return metrics
-
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -707,10 +724,10 @@ def parse_args() -> argparse.Namespace:
         "--sample-count",
         type=int,
         default=100,
-
     )
     p.add_argument("--seed", type=int, default=42, help="RNG seed for reproducibility.")
     return p.parse_args()
+
 
 def run_experiment():
     wandb.init(
@@ -735,11 +752,9 @@ def run_experiment():
         vocab_size=0,
         out_jsonl=Path("corrupted.jsonl"),
         seed=42,
-        return_metrics=True,
     )
 
     wandb.log(metrics)
-
 
 
 def main() -> None:
@@ -765,5 +780,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

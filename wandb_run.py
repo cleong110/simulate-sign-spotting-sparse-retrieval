@@ -1,4 +1,3 @@
-import itertools
 from pathlib import Path
 import wandb
 from simulate_sign_spotter import run_simulation
