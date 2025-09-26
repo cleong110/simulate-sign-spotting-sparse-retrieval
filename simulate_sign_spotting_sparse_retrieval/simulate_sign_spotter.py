@@ -28,18 +28,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import (
-    Dict,
     Iterable,
-    List,
     Mapping,
     MutableMapping,
-    Optional,
     Sequence,
-    Tuple,
 )
-import wandb
+
 from tqdm import tqdm
 
+import wandb
 
 # -------------------------
 # Logging / defaults
@@ -59,8 +56,8 @@ class SpotterConfig:
     p_false_negative: float = 0.1
     p_false_positive: float = 0.02
     p_substitution: float = 0.0
-    per_gloss_fn: Optional[Mapping[str, float]] = None
-    per_gloss_fp: Optional[Mapping[str, float]] = None
+    per_gloss_fn: Mapping[str, float] | None = None
+    per_gloss_fp: Mapping[str, float] | None = None
     seed: int = 42
 
 
@@ -70,8 +67,8 @@ class LengthEstimatorConfig:
         sigma: float = 0.0,
         bias: float = 0.0,
         min_len: int = 1,
-        max_len: Optional[int] = None,
-        seed: Optional[int] = None,
+        max_len: int | None = None,
+        seed: int | None = None,
     ):
         self.sigma = sigma
         self.bias = bias
@@ -90,10 +87,10 @@ def safe_choice(seq: Sequence[str], rnd: random.Random) -> str:
     return rnd.choice(seq)
 
 
-def compute_df_and_avgdl(docs: Iterable[Sequence[str]]) -> Tuple[Dict[str, int], float]:
+def compute_df_and_avgdl(docs: Iterable[Sequence[str]]) -> tuple[dict[str, int], float]:
     """Compute document frequency (DF) per token and average document length (avgdl)."""
     df: MutableMapping[str, int] = {}
-    lens: List[int] = []
+    lens: list[int] = []
     for tokens in docs:
         lens.append(len(tokens))
         seen = set(tokens)
@@ -172,7 +169,7 @@ def simulate_spotter_on_doc(
 def estimate_length(
     true_tokens: Sequence[str],
     config: LengthEstimatorConfig,
-    rnd: Optional[random.Random] = None,
+    rnd: random.Random | None = None,
 ) -> int:
     """Estimate document length from noisy segmenter."""
     rnd_local = rnd or random.Random(config.seed)
@@ -190,13 +187,11 @@ def estimate_length(
 # Corpus I/O
 # -------------------------
 def write_corrupted_corpus(
-    corrupted_docs: List[Tuple[str, Sequence[str], Sequence[str], int, int]],
+    corrupted_docs: list[tuple[str, Sequence[str], Sequence[str], int, int]],
     out_jsonl: Path,
     use_length_estimator: bool,
 ) -> None:
-    """
-    Write JSONL with doc_id, true tokens, spotted tokens, and both length measures.
-    """
+    """Write JSONL with doc_id, true tokens, spotted tokens, and both length measures."""
     with out_jsonl.open("w", encoding="utf-8") as f:
         for doc_id, true_tokens, spotted_tokens, est_len, length_used in corrupted_docs:
             spotted_len = len(spotted_tokens)
@@ -213,12 +208,12 @@ def write_corrupted_corpus(
             f.write(json.dumps(rec) + "\n")
 
 
-def load_corpus_jsonl(path: Path) -> List[Tuple[str, List[str]]]:
+def load_corpus_jsonl(path: Path) -> list[tuple[str, list[str]]]:
     """
     Load a JSONL corpus where each line is {"doc_id": "...", "tokens": ["g1","g2",...]}
     or {"doc_id": "...", "true_tokens": [...]}.
     """
-    docs: List[Tuple[str, List[str]]] = []
+    docs: list[tuple[str, list[str]]] = []
     with path.open("r", encoding="utf8") as fh:
         for line in fh:
             rec = json.loads(line)
@@ -242,7 +237,7 @@ def load_corpus_jsonl(path: Path) -> List[Tuple[str, List[str]]]:
 # -------------------------
 # Tiny BM25 utilities
 # -------------------------
-def build_bm25_index(docs: Iterable[Dict[str, object]]) -> Dict[str, object]:
+def build_bm25_index(docs: Iterable[dict[str, object]]) -> dict[str, object]:
     """
     Build a simple BM25 index from a sequence of precomputed JSONL-style records.
 
@@ -267,16 +262,16 @@ def build_bm25_index(docs: Iterable[Dict[str, object]]) -> Dict[str, object]:
         Dict[str, object]: BM25 index dictionary suitable for `bm25_score`.
     """
     N = len(docs)
-    df: Dict[str, int] = {}
-    tf: Dict[str, Dict[str, int]] = {}
-    doc_len: Dict[str, int] = {}
+    df: dict[str, int] = {}
+    tf: dict[str, dict[str, int]] = {}
+    doc_len: dict[str, int] = {}
 
     for rec in docs:
         doc_id = rec["doc_id"]
-        tokens: List[str] = rec["spotted_tokens"]
+        tokens: list[str] = rec["spotted_tokens"]
         length_used: int = rec["length_used"]
 
-        seen: Dict[str, int] = {}
+        seen: dict[str, int] = {}
         for t in tokens:
             seen[t] = seen.get(t, 0) + 1
         tf[doc_id] = seen
@@ -286,7 +281,7 @@ def build_bm25_index(docs: Iterable[Dict[str, object]]) -> Dict[str, object]:
             df[t] = df.get(t, 0) + 1
 
     avgdl = mean(doc_len.values()) if doc_len else 0.0
-    idf: Dict[str, float] = {
+    idf: dict[str, float] = {
         t: math.log(1 + (N - dfv + 0.5) / (dfv + 0.5)) for t, dfv in df.items()
     }
 
@@ -295,19 +290,19 @@ def build_bm25_index(docs: Iterable[Dict[str, object]]) -> Dict[str, object]:
 
 def bm25_score(
     query: Sequence[str],
-    index: Dict[str, object],
+    index: dict[str, object],
     k1: float = 1.2,
     b: float = 0.75,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """
     Score each document in the index for the given query (bag-of-terms BM25).
     Returns mapping doc_id -> score.
     """
-    idf: Dict[str, float] = index["idf"]
-    tf_index: Dict[str, Dict[str, int]] = index["tf"]
-    doc_len: Dict[str, int] = index["doc_len"]
+    idf: dict[str, float] = index["idf"]
+    tf_index: dict[str, dict[str, int]] = index["tf"]
+    doc_len: dict[str, int] = index["doc_len"]
     avgdl: float = index["avgdl"]
-    scores: Dict[str, float] = {}
+    scores: dict[str, float] = {}
     for doc_id, tfs in tf_index.items():
         s = 0.0
         dl = doc_len.get(doc_id, 0)
@@ -326,7 +321,7 @@ def bm25_score(
 # ------------------------
 def sign_spotting_precision_recall_at_k(
     true_tokens: Sequence[str], retrieved_tokens: Sequence[str], k: int
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """
     Compute Precision@k and Recall@k for a single document.
 
@@ -337,6 +332,7 @@ def sign_spotting_precision_recall_at_k(
 
     Returns:
         precision, recall: both in [0, 1]
+
     """
     if not true_tokens:
         return 0.0, 0.0
@@ -354,12 +350,10 @@ def sign_spotting_precision_recall_at_k(
 # Retrieval Performance
 # --------------------------
 def bm25_score_degradation(
-    scores_true: Dict[str, float], scores_spotted: Dict[str, float]
-) -> Dict[str, float]:
-    """
-    Compute relative drop in BM25 score per document.
-    """
-    degradation: Dict[str, float] = {}
+    scores_true: dict[str, float], scores_spotted: dict[str, float]
+) -> dict[str, float]:
+    """Compute relative drop in BM25 score per document."""
+    degradation: dict[str, float] = {}
     for doc_id, s_true in scores_true.items():
         s_spot = scores_spotted.get(doc_id, 0.0)
         degradation[doc_id] = 1.0 - (s_spot / s_true) if s_true > 0 else 0.0
@@ -367,29 +361,25 @@ def bm25_score_degradation(
 
 
 def rank_correlation_at_k(
-    true_ranking: List[str],  # doc_ids sorted by true BM25
-    spotted_ranking: List[str],  # doc_ids sorted by spotted BM25
+    true_ranking: list[str],  # doc_ids sorted by true BM25
+    spotted_ranking: list[str],  # doc_ids sorted by spotted BM25
     k: int,
 ) -> float:
-    """
-    Returns fraction of overlap in top-k docs.
-    """
+    """Returns fraction of overlap in top-k docs."""
     top_true = set(true_ranking[:k])
     top_spot = set(spotted_ranking[:k])
     return len(top_true & top_spot) / k
 
 
 def dcg_at_k(relevances: Sequence[float], k: int) -> float:
-    """
-    Compute Discounted Cumulative Gain at k.
-    """
+    """Compute Discounted Cumulative Gain at k."""
     dcg = 0.0
     for i, rel in enumerate(relevances[:k]):
         dcg += rel / math.log2(i + 2)  # i+2 because log2(1) = 0
     return dcg
 
 
-def ndcg_at_k(top_docs: Sequence[str], scores_true: Dict[str, float], k: int) -> float:
+def ndcg_at_k(top_docs: Sequence[str], scores_true: dict[str, float], k: int) -> float:
     """
     Compute NDCG@k for retrieved documents against true BM25 scores.
 
@@ -400,6 +390,7 @@ def ndcg_at_k(top_docs: Sequence[str], scores_true: Dict[str, float], k: int) ->
 
     Returns:
         NDCG@k in [0,1]
+
     """
     # Relevance in retrieved order
     rels = [scores_true.get(doc_id, 0.0) for doc_id in top_docs]
@@ -417,7 +408,7 @@ def ndcg_at_k(top_docs: Sequence[str], scores_true: Dict[str, float], k: int) ->
 # -------------------------
 def run_simulation(
     *,
-    input_jsonl: Optional[Path],
+    input_jsonl: Path | None,
     synthetic: bool,
     n_docs: int,
     avg_doc_len: int,
@@ -433,9 +424,7 @@ def run_simulation(
     sample_count: int,
     seed: int,
 ) -> dict:
-    """
-    Main simulation runner with BM25 degradation.
-    """
+    """Main simulation runner with BM25 degradation."""
     rnd = random.Random(seed)
 
     # -------------------------------
@@ -633,7 +622,7 @@ def run_simulation(
         "spotted_len_total": sum(s["spotted_len"] for s in doc_stats),
     }
 
-    agg_stats["proportion_of_spotted_still_true"] = agg_stats["true_positives_kept_total"] / agg_stats['spotted_len_total']
+    agg_stats["proportion_of_spotted_still_true"] = agg_stats["true_positives_kept_total"] / agg_stats["spotted_len_total"]
 
     metrics = {
         "precision": mean(precisions),
