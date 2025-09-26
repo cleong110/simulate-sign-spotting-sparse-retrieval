@@ -130,6 +130,7 @@ def simulate_spotter_on_doc(
         "true_positives_dropped": 0,
         "false_positives_inserted": 0,
         "substitutions_made": 0,
+        "spotted_count": 0,
     }
 
     for tok in true_tokens:
@@ -160,7 +161,7 @@ def simulate_spotter_on_doc(
             fp_tok = rnd.choice(config.spotter_vocab)
             spotted.append(fp_tok)
             stats["false_positives_inserted"] += 1
-
+    stats["spotted_count"] = len(spotted)
     return spotted, stats
 
 
@@ -630,6 +631,7 @@ def run_simulation(
             s["false_positives_inserted"] for s in doc_stats
         ),
         "substitutions_made_total": sum(s["substitutions_made"] for s in doc_stats),
+        "spotted_count_total": sum(s["spotted_count"] for s in doc_stats),
     }
 
     metrics = {

@@ -93,6 +93,8 @@ def main():
         wandb.finish()
 
         print("Metrics:", metrics)
+        for key, value in metrics.items():
+            print(key, value)
 
 
 if __name__ == "__main__":
