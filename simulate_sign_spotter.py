@@ -633,6 +633,8 @@ def run_simulation(
         "spotted_len_total": sum(s["spotted_len"] for s in doc_stats),
     }
 
+    agg_stats["proportion_of_spotted_still_true"] = agg_stats["true_positives_kept_total"] / agg_stats['spotted_len_total']
+
     metrics = {
         "precision": mean(precisions),
         "recall": mean(recalls),
